@@ -1,0 +1,14 @@
+# Python: 3.10
+#
+# PyTorch 请根据服务器 CUDA 版本安装。例如 CUDA 11.8：
+# pip install torch==2.1.2 --index-url https://download.pytorch.org/whl/cu118
+# 然后再执行：pip install -r requirements.txt
+
+numpy==1.26.4
+pandas==2.2.2
+scipy==1.13.1
+scikit-learn==1.5.1
+joblib==1.4.2
+tqdm==4.66.5
+einops==0.8.0
+torch==2.1.2
