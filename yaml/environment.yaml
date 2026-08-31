@@ -1,0 +1,25 @@
+name: fusion_reproduce
+
+channels:
+  - conda-forge
+
+dependencies:
+  # Keep the Python version used by the supplied Fusion/RF/Attention code.
+  - python=3.10
+  - pip
+
+  # Used by the three model scripts and offline evaluation/plotting.
+  - numpy>=1.26,<2
+  - pandas>=2.1,<2.3
+  - scipy>=1.11,<1.16
+  - scikit-learn>=1.3,<1.6
+  - matplotlib>=3.7,<3.10
+  - tqdm>=4.65,<5
+  - pyyaml>=6,<7
+
+  # Packages without a required conda entry are installed through pip.
+  # The CUDA-specific PyTorch wheel is intentionally kept in the separate
+  # requirements-pytorch-cu128.txt file below.
+  - pip:
+      - einops==0.8.0
+      - shap==0.49.1
