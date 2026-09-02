@@ -4,9 +4,13 @@
 仅改变输入特征集合。每个消融模式独立训练、选择阈值、保存模型和评估结果。
 """
 
+import hashlib
+import json
 import os
-import re
 import random
+import re
+import shutil
+import subprocess
 import warnings
 from datetime import datetime
 
@@ -27,14 +31,18 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
-from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
 warnings.filterwarnings("ignore")
 
 
-DATA_PATH = "./data/features_summary_renamed.csv"
+DATA_PATH = "./feature_out/features_summary_renamed.csv"
+SPLIT_MANIFEST_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "feature_out",
+    "split_manifest.csv",
+)
 SAVE_ROOT = "./output"
 SEED = 42
 OUTER_FOLD = 5
@@ -54,6 +62,9 @@ CALIBRATION_BINS = 10
 THRESHOLD_OBJECTIVE = "balanced_acc"
 THRESHOLD_GRID = np.arange(0.0, 1.001, 0.01)
 RUN_START_TIME = ""
+CONFIG_SNAPSHOT_PATH = ""
+CONFIG_SHA256 = ""
+CODE_COMMIT = ""
 
 EPOCH_METRIC_COLUMNS = [
     "model", "ablation", "outer_fold", "inner_fold", "seed", "epoch",
@@ -62,9 +73,10 @@ EPOCH_METRIC_COLUMNS = [
 ]
 RUN_MANIFEST_COLUMNS = [
     "run_id", "model", "ablation", "outer_fold", "seed", "config_file",
-    "config_sha256", "code_commit", "start_time", "end_time",
-    "selected_epoch", "selected_threshold", "threshold_objective",
-    "checkpoint_path",
+    "config_sha256", "training_manifest_sha256", "code_commit",
+    "start_time", "end_time", "selected_epoch", "selected_threshold",
+    "threshold_objective", "checkpoint_path", "relative_path", "bytes",
+    "sha256",
 ]
 PREDICTION_COLUMNS = [
     "model", "ablation", "animal_id", "label", "outer_fold",
@@ -721,23 +733,36 @@ def train_fixed(data, class_weight, seed, epochs):
     return model
 
 
-def inner_oof(df_outer_train, train_meta, fold_idx, class_weight, ablation_mode):
+def inner_oof(
+    df_outer_train,
+    train_meta,
+    split_manifest,
+    fold_idx,
+    class_weight,
+    ablation_mode,
+):
     labels = train_meta["label"].to_numpy(np.int64)
     keys = train_meta["video_key"].to_numpy()
     key_to_index = {key: index for index, key in enumerate(keys)}
     oof = np.full(len(keys), np.nan, dtype=np.float64)
     best_epochs = []
-    n_splits = min(INNER_FOLD, int(train_meta["label"].value_counts().min()))
-    cv = StratifiedGroupKFold(
-        n_splits=n_splits,
-        shuffle=True,
-        random_state=SEED + fold_idx * 100,
-    )
-    for inner_idx, (fit_idx, val_idx) in enumerate(
-        cv.split(train_meta, labels, groups=train_meta["video_key"]), 1
-    ):
-        fit_keys = set(train_meta.iloc[fit_idx]["video_key"])
-        val_keys = set(train_meta.iloc[val_idx]["video_key"])
+    fold_manifest = split_manifest[
+        split_manifest["outer_fold"].eq(fold_idx)
+    ]
+    for inner_idx in range(1, INNER_FOLD + 1):
+        inner_manifest = fold_manifest[
+            fold_manifest["inner_fold"].eq(inner_idx)
+        ]
+        fit_keys = set(
+            inner_manifest.loc[
+                inner_manifest["role"].eq("inner_train"), "video_key"
+            ]
+        )
+        val_keys = set(
+            inner_manifest.loc[
+                inner_manifest["role"].eq("inner_val"), "video_key"
+            ]
+        )
         if fit_keys & val_keys:
             raise AssertionError("inner train/validation video overlap")
         data = prepare_sequences(
@@ -1027,92 +1052,243 @@ def build_video_table(df):
     )
 
 
+def sha256_file(file_path):
+    """计算文件 SHA-256。"""
+    digest = hashlib.sha256()
+    with open(file_path, "rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def save_split_manifest(video_meta, output_path):
-    """保存 outer/inner 的固定视频级划分清单。"""
-    rows = []
-    label_map = dict(
-        zip(video_meta["video_key"].astype(str), video_meta["label"].astype(int))
+def get_git_commit():
+    """获取当前代码所在 Git 仓库的完整 commit。"""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            check=False,
+        )
+        commit = result.stdout.strip()
+        return commit if commit else "not_available"
+    except (OSError, subprocess.SubprocessError):
+        return "not_available"
+
+
+def build_config_snapshot():
+    """收集本次训练实际使用的配置。"""
+    config_names = [
+        "DATA_PATH", "SPLIT_MANIFEST_PATH", "SAVE_ROOT", "SEED",
+        "OUTER_FOLD", "INNER_FOLD", "MAX_SEGMENTS", "EPOCHS",
+        "BATCH_SIZE", "LR", "WEIGHT_DECAY", "PATIENCE", "FINAL_SEEDS",
+        "DEVICE", "BOOTSTRAP_REPS", "CALIBRATION_BINS",
+        "THRESHOLD_OBJECTIVE", "THRESHOLD_GRID", "FEATURE_COLS",
+        "USE_MISSING_INDICATORS", "CLASS_WEIGHT_CANDIDATES",
+        "ABLATION_MODES",
+    ]
+    config = {"source_file": os.path.abspath(__file__)}
+    for name in config_names:
+        value = globals()[name]
+        if isinstance(value, np.ndarray):
+            value = value.tolist()
+        elif isinstance(value, tuple):
+            value = list(value)
+        elif isinstance(value, torch.device):
+            value = str(value)
+        config[name] = value
+    return config
+
+
+def prepare_run_metadata():
+    """生成配置快照、配置 SHA-256 和代码 commit。"""
+    global CONFIG_SNAPSHOT_PATH, CONFIG_SHA256, CODE_COMMIT
+
+    os.makedirs(SAVE_ROOT, exist_ok=True)
+    config_path = os.path.abspath(
+        os.path.join(SAVE_ROOT, "config_snapshot.json")
+    )
+    with open(config_path, "w", encoding="utf-8") as file_obj:
+        json.dump(
+            build_config_snapshot(),
+            file_obj,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+        file_obj.write("\n")
+
+    CONFIG_SNAPSHOT_PATH = config_path
+    CONFIG_SHA256 = sha256_file(config_path)
+    CODE_COMMIT = get_git_commit()
+
+
+def load_split_manifest(video_meta, manifest_path):
+    """读取并校验固定的 outer/inner 五折视频划分。"""
+    manifest_path = os.path.abspath(manifest_path)
+    if not os.path.isfile(manifest_path):
+        raise FileNotFoundError(f"训练划分清单不存在：{manifest_path}")
+
+    manifest = pd.read_csv(
+        manifest_path,
+        dtype={"animal_id": str, "video_key": str},
+    )
+    manifest.columns = manifest.columns.astype(str).str.strip()
+    required = {"video_key", "label", "outer_fold", "role", "inner_fold"}
+    missing = required - set(manifest.columns)
+    if missing:
+        raise ValueError(f"训练划分清单缺少字段：{sorted(missing)}")
+
+    manifest["video_key"] = manifest["video_key"].astype(str).str.strip()
+    manifest["role"] = manifest["role"].astype(str).str.strip()
+    manifest["label"] = pd.to_numeric(
+        manifest["label"], errors="raise"
+    ).astype(int)
+    manifest["outer_fold"] = pd.to_numeric(
+        manifest["outer_fold"], errors="raise"
+    ).astype(int)
+    manifest["inner_fold"] = pd.to_numeric(
+        manifest["inner_fold"], errors="coerce"
     )
 
-    outer_cv = StratifiedGroupKFold(
-        n_splits=OUTER_FOLD,
-        shuffle=True,
-        random_state=SEED,
-    )
+    allowed_roles = {"outer_test", "inner_train", "inner_val"}
+    unknown_roles = sorted(set(manifest["role"]) - allowed_roles)
+    if unknown_roles:
+        raise ValueError(f"训练划分清单包含未知 role：{unknown_roles}")
+    if manifest.loc[
+        manifest["role"].isin({"inner_train", "inner_val"}),
+        "inner_fold",
+    ].isna().any():
+        raise ValueError("inner_train/inner_val 记录缺少 inner_fold")
+    if manifest.duplicated(
+        ["video_key", "outer_fold", "role", "inner_fold"]
+    ).any():
+        raise ValueError("训练划分清单包含重复记录")
 
-    for outer_fold, (outer_train_idx, outer_test_idx) in enumerate(
-        outer_cv.split(
-            video_meta,
-            video_meta["label"],
-            groups=video_meta["video_key"],
-        ),
-        start=1,
+    video_keys = video_meta["video_key"].astype(str)
+    dataset_keys = set(video_keys)
+    manifest_keys = set(manifest["video_key"])
+    if dataset_keys != manifest_keys:
+        missing_keys = sorted(dataset_keys - manifest_keys)
+        extra_keys = sorted(manifest_keys - dataset_keys)
+        raise ValueError(
+            "训练数据与划分清单的视频不一致："
+            f"missing={missing_keys[:10]}, extra={extra_keys[:10]}"
+        )
+
+    label_map = dict(zip(video_keys, video_meta["label"].astype(int)))
+    expected_labels = manifest["video_key"].map(label_map)
+    if not manifest["label"].eq(expected_labels).all():
+        bad_keys = manifest.loc[
+            ~manifest["label"].eq(expected_labels), "video_key"
+        ].drop_duplicates().tolist()
+        raise ValueError(f"训练数据与划分清单标签不一致：{bad_keys[:10]}")
+
+    expected_outer_folds = list(range(1, OUTER_FOLD + 1))
+    actual_outer_folds = sorted(manifest["outer_fold"].unique().tolist())
+    if actual_outer_folds != expected_outer_folds:
+        raise ValueError(
+            f"outer fold 应为 {expected_outer_folds}，实际为 {actual_outer_folds}"
+        )
+
+    outer_test_rows = manifest[manifest["role"].eq("outer_test")]
+    outer_test_counts = outer_test_rows["video_key"].value_counts()
+    if (
+        set(outer_test_counts.index) != dataset_keys
+        or not outer_test_counts.eq(1).all()
     ):
-        outer_train = video_meta.iloc[outer_train_idx].reset_index(drop=True)
-        outer_test = video_meta.iloc[outer_test_idx].reset_index(drop=True)
+        raise ValueError("每个视频必须且只能出现于一个 outer_test fold")
 
-        for key in outer_test["video_key"].astype(str):
-            rows.append(
-                {
-                    "animal_id": key,
-                    "video_key": key,
-                    "label": label_map[key],
-                    "outer_fold": outer_fold,
-                    "role": "outer_test",
-                    "inner_fold": "",
-                    "split_seed": SEED,
-                    "split_version": "sgkf_v1",
-                }
+    index_by_key = {key: index for index, key in enumerate(video_keys)}
+    outer_splits = []
+    for outer_fold in expected_outer_folds:
+        fold_manifest = manifest[manifest["outer_fold"].eq(outer_fold)]
+        test_keys = set(
+            fold_manifest.loc[
+                fold_manifest["role"].eq("outer_test"), "video_key"
+            ]
+        )
+        train_keys = dataset_keys - test_keys
+        inner_manifest = fold_manifest[
+            fold_manifest["role"].isin({"inner_train", "inner_val"})
+        ]
+        if set(inner_manifest["video_key"]) != train_keys:
+            raise ValueError(f"outer fold {outer_fold} 的训练视频集合不完整")
+
+        actual_inner_folds = sorted(
+            inner_manifest["inner_fold"].astype(int).unique().tolist()
+        )
+        expected_inner_folds = list(range(1, INNER_FOLD + 1))
+        if actual_inner_folds != expected_inner_folds:
+            raise ValueError(
+                f"outer fold {outer_fold} 的 inner fold 应为 "
+                f"{expected_inner_folds}，实际为 {actual_inner_folds}"
             )
 
-        n_inner = min(
-            INNER_FOLD,
-            int(outer_train["label"].value_counts().min()),
-        )
-        inner_cv = StratifiedGroupKFold(
-            n_splits=n_inner,
-            shuffle=True,
-            random_state=SEED + outer_fold * 100,
-        )
+        for inner_fold in expected_inner_folds:
+            current = inner_manifest[
+                inner_manifest["inner_fold"].eq(inner_fold)
+            ]
+            inner_train_keys = set(
+                current.loc[current["role"].eq("inner_train"), "video_key"]
+            )
+            inner_val_keys = set(
+                current.loc[current["role"].eq("inner_val"), "video_key"]
+            )
+            if inner_train_keys & inner_val_keys:
+                raise ValueError(
+                    f"outer fold {outer_fold} / inner fold {inner_fold} 存在重叠"
+                )
+            if inner_train_keys | inner_val_keys != train_keys:
+                raise ValueError(
+                    f"outer fold {outer_fold} / inner fold {inner_fold} "
+                    "未完整覆盖 outer train"
+                )
 
-        for inner_fold, (inner_train_idx, inner_val_idx) in enumerate(
-            inner_cv.split(
-                outer_train,
-                outer_train["label"],
-                groups=outer_train["video_key"],
-            ),
-            start=1,
+        inner_val_counts = inner_manifest.loc[
+            inner_manifest["role"].eq("inner_val"), "video_key"
+        ].value_counts()
+        if (
+            set(inner_val_counts.index) != train_keys
+            or not inner_val_counts.eq(1).all()
         ):
-            for role, indices in (
-                ("inner_train", inner_train_idx),
-                ("inner_val", inner_val_idx),
-            ):
-                for key in outer_train.iloc[indices]["video_key"].astype(str):
-                    rows.append(
-                        {
-                            "animal_id": key,
-                            "video_key": key,
-                            "label": label_map[key],
-                            "outer_fold": outer_fold,
-                            "role": role,
-                            "inner_fold": inner_fold,
-                            "split_seed": SEED + outer_fold * 100,
-                            "split_version": "sgkf_v1",
-                        }
-                    )
+            raise ValueError(
+                f"outer fold {outer_fold} 的每个训练视频必须且只能验证一次"
+            )
 
-    pd.DataFrame(rows).to_csv(
-        output_path,
-        index=False,
-        encoding="utf-8-sig",
-    )
+        train_idx = np.asarray(
+            [index_by_key[key] for key in video_keys if key in train_keys],
+            dtype=np.int64,
+        )
+        test_idx = np.asarray(
+            [index_by_key[key] for key in video_keys if key in test_keys],
+            dtype=np.int64,
+        )
+        outer_splits.append((train_idx, test_idx))
+
+    return manifest, outer_splits
 
 
 def save_run_manifest(summary, output_root, run_start_time):
-    """保存每个 outer fold 的运行、阈值和模型文件记录。"""
+    """保存正式运行清单、模型文件哈希并清理重复列。"""
+    global CONFIG_SNAPSHOT_PATH, CONFIG_SHA256, CODE_COMMIT
+
+    if not CONFIG_SNAPSHOT_PATH:
+        prepare_run_metadata()
+
     end_time = datetime.now().isoformat(timespec="seconds")
+    model_paths = []
+    for relative_model_path in summary["model_bundle"].astype(str):
+        model_path = os.path.abspath(
+            os.path.join(output_root, relative_model_path)
+        )
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(f"模型文件不存在：{model_path}")
+        model_paths.append(model_path)
+
     required = pd.DataFrame({
         "run_id": [
             f"attention_{str(ablation)}_outer_fold_{int(fold)}"
@@ -1122,35 +1298,44 @@ def save_run_manifest(summary, output_root, run_start_time):
         "ablation": summary["ablation"].astype(str),
         "outer_fold": summary["outer_fold"].astype(int),
         "seed": SEED,
-        "config_file": "",
-        "config_sha256": "",
-        "code_commit": "",
+        "config_file": CONFIG_SNAPSHOT_PATH,
+        "config_sha256": CONFIG_SHA256,
+        "training_manifest_sha256": sha256_file(SPLIT_MANIFEST_PATH),
+        "code_commit": CODE_COMMIT,
         "start_time": run_start_time,
         "end_time": end_time,
         "selected_epoch": summary["epochs"],
         "selected_threshold": summary["threshold"],
         "threshold_objective": THRESHOLD_OBJECTIVE,
-        "checkpoint_path": [
-            os.path.abspath(os.path.join(output_root, path))
-            for path in summary["model_bundle"]
+        "checkpoint_path": model_paths,
+        "relative_path": [
+            os.path.relpath(path, SAVE_ROOT).replace(os.sep, "/")
+            for path in model_paths
         ],
+        "bytes": [os.path.getsize(path) for path in model_paths],
+        "sha256": [sha256_file(path) for path in model_paths],
     })
     extras = summary.drop(columns=["threshold"], errors="ignore").reset_index(drop=True)
-    manifest = pd.concat([required, extras], axis=1)
+    manifest = required.copy()
+    for column in extras.columns:
+        if column not in manifest.columns:
+            manifest[column] = extras[column].to_numpy()
+    manifest = manifest.loc[:, ~manifest.columns.duplicated()]
     ordered_columns = RUN_MANIFEST_COLUMNS + [
         column for column in manifest.columns if column not in RUN_MANIFEST_COLUMNS
     ]
+    manifest = manifest[ordered_columns]
     logs_dir = os.path.join(output_root, "logs")
     os.makedirs(logs_dir, exist_ok=True)
-    manifest[ordered_columns].to_csv(
+    manifest.to_csv(
         os.path.join(logs_dir, "run_manifest.csv"),
         index=False,
         encoding="utf-8-sig",
     )
     global_path = os.path.join(SAVE_ROOT, "logs", "run_manifest.csv")
     os.makedirs(os.path.dirname(global_path), exist_ok=True)
-    header = not os.path.exists(global_path)
-    manifest[ordered_columns].to_csv(
+    header = not os.path.exists(global_path) or os.path.getsize(global_path) == 0
+    manifest[RUN_MANIFEST_COLUMNS].to_csv(
         global_path,
         mode="a",
         header=header,
@@ -1184,7 +1369,7 @@ def consolidate_epoch_metrics():
     )
 
 
-def run_one_ablation(df, videos, outer_splits, ablation_mode):
+def run_one_ablation(df, videos, outer_splits, split_manifest, ablation_mode):
     output_root = os.path.join(SAVE_ROOT, ablation_mode)
     os.makedirs(output_root, exist_ok=True)
     summary_rows = []
@@ -1205,6 +1390,7 @@ def run_one_ablation(df, videos, outer_splits, ablation_mode):
             labels, probabilities, epochs = inner_oof(
                 df_train,
                 train_meta,
+                split_manifest,
                 fold,
                 class_weight,
                 ablation_mode,
@@ -1399,6 +1585,7 @@ def main():
     RUN_START_TIME = datetime.now().isoformat(timespec="seconds")
     os.makedirs(SAVE_ROOT, exist_ok=True)
     os.makedirs(os.path.join(SAVE_ROOT, "logs"), exist_ok=True)
+    prepare_run_metadata()
     pd.DataFrame(columns=RUN_MANIFEST_COLUMNS).to_csv(
         os.path.join(SAVE_ROOT, "logs", "run_manifest.csv"),
         index=False,
@@ -1409,22 +1596,13 @@ def main():
     videos = build_video_table(df)
     if int(videos["label"].value_counts().min()) < OUTER_FOLD:
         raise ValueError("最少类别视频数不足以进行五折划分")
-    save_split_manifest(
-        videos,
-        os.path.join(SAVE_ROOT, "split_manifest.csv"),
+    split_manifest, outer_splits = load_split_manifest(
+        videos, SPLIT_MANIFEST_PATH
     )
+    output_manifest_path = os.path.join(SAVE_ROOT, "split_manifest.csv")
+    if os.path.abspath(output_manifest_path) != os.path.abspath(SPLIT_MANIFEST_PATH):
+        shutil.copyfile(SPLIT_MANIFEST_PATH, output_manifest_path)
     print(f"device={DEVICE}, rows={len(df)}, videos={len(videos)}")
-
-    outer_cv = StratifiedGroupKFold(
-        n_splits=OUTER_FOLD,
-        shuffle=True,
-        random_state=SEED,
-    )
-    outer_splits = list(outer_cv.split(
-        videos,
-        videos["label"],
-        groups=videos["video_key"],
-    ))
 
     summaries = []
     pooled_metrics = []
@@ -1436,6 +1614,7 @@ def main():
             df,
             videos,
             outer_splits,
+            split_manifest,
             ablation_mode,
         )
         summaries.append(summary)
